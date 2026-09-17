@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+ENGIPEC — EXTENSÃO DO SISTEMA v1.8
+===================================
+Conecta-se ao 'analise_financeira.py' sem alterá-lo.
+
+Correções nesta versão:
+  v1.3 — CSS responsivo não-invasivo (celular, tablet e PC), sem mexer em cores.
+  v1.4 — Consolidado passou a somar todas as unidades (antes filtrava vazio).
+  v1.5 — filtrarLojas() respeita a unidade selecionada.
+  v1.6 — Adicionado "Tipo de Visão" (Acumulado vs Mensal) com mês único.
+  v1.7 — atualizarMeses() reescrito para preservar seleção por valor.
+  v1.8 — Reescrita completa da injeção:
+         • Removido o "Tipo de Visão" (confuso com De/Até existente);
+         • Substituído por um seletor único "Mês de Referência" que aparece ao lado;
+         • Botão toggle "📅 Somente este mês" agora é injetado com fallback robusto;
+         • Quando ativo: Mês De = Mês Até = mês selecionado (intervalo de 1);
+         • atualizarMeses() não reseta mais a seleção do usuário;
+         • init() reescrito com retry para garantir que o DOM está pronto;
+         • Filtros funcionam em todos os dispositivos (responsivo).
+"""
+import re
+from pathlib import Path
+import webbrowser
+
+# 🔗 CONEXÃO COM O SISTEMA ORIGINAL
+try:
+    import analise_financeira as motor_original
+except ImportError:
+    print("❌ ERRO: O arquivo 'analise_financeira.py' não foi encontrado na mesma pasta.")
+    exit()
+
+# 🎨 ============ CSS RESPONSIVO (NÃO-INVASIVO) ============
+CSS_RESPONSIVO = """
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  font-size: clamp(14px, 0.8vw + 10px, 16px);
+  line-height: 1.45;
+  overflow-x: hidden;
+}
+
+img, canvas, svg, video { max-width: 100%; height: auto; }
+
+h1 { font-size: clamp(18px, 3vw, 28px); }
+h2 { font-size: clamp(16px, 2.5vw, 24px); }
+h3 { font-size: clamp(14px, 2vw, 20px); }
+
+.container, .conteudo, .dashboard, .painel,
+main, section, header, footer {
+  width: 100%;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding-left: clamp(8px, 2vw, 20px);
+  padding-right: clamp(8px, 2vw, 20px);
+}
+
+.table-wrapper, .tabela-wrapper, .table-responsive,
+[class*="table-wrap"], [class*="table-responsive"] {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+table { width: 100%; border-collapse: collapse; }
+td, th { word-break: break-word; }
+
+button, .btn, .botao, a.button, input, select {
+  font-size: 16px;
+  min-height: 44px;
+  padding: 8px 16px;
+}
+
+@media (max-width: 639px) {
+  .row, .cards, .kpis, .metricas,
+  [class*="row-cols"], [class*="g-"] {
+    flex-direction: column !important;
+    display: flex !important;
+    flex-wrap: wrap;
+  }
+  .row > *, .cards > *, .kpis > *, .metricas > *,
+  [class*="col-"], [class*="card"] {
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 0 100% !important;
+    margin-bottom: 8px;
+  }
+  table { min-width: 560px; }
+  .hide-mobile, .d-none.d-md-block, .d-none.d-lg-block { display: none !important; }
+}
+
+@media (min-width: 640px) and (max-width: 1023px) {
+  .row > *, .cards > *, .kpis > *, .metricas > *,
+  [class*="col-md"], [class*="col-lg"] {
+    flex: 0 0 48% !important;
+    max-width: 48% !important;
+  }
+  table { min-width: 480px; }
+  .hide-tablet, .d-none.d-lg-block { display: none !important; }
+}
+
+@media (min-width: 1024px) {
+  table { min-width: 0; }
+  .only-desktop { display: block !important; }
+}
+
+/* === Botão de mês único === */
+.btn-mes-unico {
+  background-color: rgba(14, 165, 233, 0.15);
+  color: #7DD3FC;
+  border: 1px solid rgba(14, 165, 233, 0.3);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.btn-mes-unico:hover {
+  background-color: rgba(14, 165, 233, 0.25);
+  border-color: #0EA5E9;
+}
+.btn-mes-unico.active {
+  background-color: rgba(14, 165, 233, 0.3);
+  border-color: #0EA5E9;
+  color: #BAE6FD;
+}
+"""
+
+# 🛠️ ============ CORREÇÃO DEFINITIVA DOS FILTROS (v1.8) ============
+JS_CORRECAO_FILTROS = r"""
+(function(){
+  'use strict';
+
+  var AGREG = ['Consolidado', 'CONSOLIDADO', 'Todas', 'TOTAL', ''];
+
+  function temAgregado(base){
+    return base.some(function(r){ return AGREG.indexOf(r.unidade) !== -1; });
+  }
+
+  /* === 1) filtrar(): Consolidado soma todas; unidade específica isola === */
+  window.filtrar = function(ano, mesDe, mesAte, uni){
+    var base = FIN_DATA.registros.filter(function(r){
+      return r.ano === ano && r.mes_num >= mesDe && r.mes_num <= mesAte;
+    });
+    if (AGREG.indexOf(uni) !== -1) {
+      return temAgregado(base)
+        ? base.filter(function(r){ return AGREG.indexOf(r.unidade) !== -1; })
+        : base;
+    }
+    return base.filter(function(r){ return r.unidade === uni; });
+  };
+
+  /* === 2) filtrarComp(): mesma correção para YoY === */
+  window.filtrarComp = function(anoC, mesDe, mesAte, uni){
+    if (!anoC || !estado.compAtivo) return [];
+    var base = FIN_DATA.registros.filter(function(r){
+      return r.ano === anoC && r.mes_num >= mesDe && r.mes_num <= mesAte;
+    });
+    if (AGREG.indexOf(uni) !== -1) {
+      return temAgregado(base)
+        ? base.filter(function(r){ return AGREG.indexOf(r.unidade) !== -1; })
+        : base;
+    }
+    return base.filter(function(r){ return r.unidade === uni; });
+  };
+
+  /* === 3) filtrarLojas(): respeita a unidade selecionada === */
+  window.filtrarLojas = function(ano, mesDe, mesAte){
+    var base = FIN_DATA.registros.filter(function(r){
+      return r.ano === ano && r.mes_num >= mesDe && r.mes_num <= mesAte;
+    });
+    if (AGREG.indexOf(estado.unidade) !== -1) {
+      return base.filter(function(r){
+        return FIN_DATA.unidades_lojas.indexOf(r.unidade) !== -1;
+      });
+    }
+    return base.filter(function(r){ return r.unidade === estado.unidade; });
+  };
+
+  /* === 4) calcKPIs: retorna zeros em vez de null === */
+  var calcOriginal = window.calcKPIs;
+  window.calcKPIs = function(d){
+    if (!d || !d.length) {
+      return {venda:0, compra:0, res:0, rec:0, pag:0, saldo:0, margem:0,
+              mV:0, mR:0, mS:0, mM:0, mC:0, mRc:0,
+              sV:[], sR:[], sS:[], sM:[], sC:[], sRc:[], meses:[]};
+    }
+    return calcOriginal(d);
+  };
+
+  /* === 5) atualizarMeses() REESCRITO COMPLETAMENTE ===
+     Preserva a seleção por VALUE numérico, não por índice.
+     Não força curDe=0 nem curAte=6 quando os selects têm valor válido. */
+  window.atualizarMeses = function(){
+    var ano = parseInt(document.getElementById('f-ano').value);
+    var meses = FIN_DATA.meses_por_ano[ano] || [];
+    var selDe = document.getElementById('f-mes-de');
+    var selAte = document.getElementById('f-mes-ate');
+
+    if (!selDe || !selAte) return;
+
+    /* Guarda os valores numéricos selecionados ANTES de repopular */
+    var valDe = null, valAte = null;
+    if (selDe.value !== '') valDe = parseInt(selDe.value);
+    if (selAte.value !== '') valAte = parseInt(selAte.value);
+
+    /* Defaults seguros: se não havia seleção, usa primeiro e último mês */
+    if (valDe === null || isNaN(valDe)) {
+      if (meses.length > 0) {
+        valDe = FIN_DATA.meses_ordem.indexOf(meses[0]);
+        if (valDe < 0) valDe = 0;
+      } else { valDe = 0; }
+    }
+    if (valAte === null || isNaN(valAte)) {
+      if (meses.length > 0) {
+        valAte = FIN_DATA.meses_ordem.indexOf(meses[meses.length - 1]);
+        if (valAte < 0) valAte = valDe;
+      } else { valAte = valDe; }
+    }
+
+    /* Limpa e repopula */
+    selDe.innerHTML = '';
+    selAte.innerHTML = '';
+
+    meses.forEach(function(m){
+      var n = FIN_DATA.meses_ordem.indexOf(m);
+      if (n < 0) n = 0;
+
+      var o1 = document.createElement('option');
+      o1.value = n;
+      o1.textContent = m;
+      selDe.appendChild(o1);
+
+      var o2 = document.createElement('option');
+      o2.value = n;
+      o2.textContent = m;
+      selAte.appendChild(o2);
+    });
+
+    /* Restaura seleção procurando pelo VALUE (não por índice) */
+    function selecionarPorValue(sel, val){
+      for (var i = 0; i < sel.options.length; i++){
+        if (parseInt(sel.options[i].value) === val){
+          sel.selectedIndex = i;
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (!selecionarPorValue(selDe, valDe)) {
+      selDe.selectedIndex = 0;
+    }
+    if (!selecionarPorValue(selAte, valAte)) {
+      selAte.selectedIndex = selAte.options.length - 1;
+    }
+
+    /* Sincroniza o select de mês único se existir */
+    var selUnico = document.getElementById('f-mes-ref');
+    if (selUnico && selDe) {
+      selUnico.innerHTML = selDe.innerHTML;
+      selecionarPorValue(selUnico, parseInt(selDe.value));
+    }
+  };
+
+  /* === 6) toggleComp() preservado === */
+  window.toggleComp = function(){
+    var cb = document.getElementById('f-comp-toggle');
+    var wrap = document.getElementById('f-comp-wrap');
+    if (cb.checked) {
+      wrap.style.opacity = '1';
+      wrap.style.pointerEvents = 'auto';
+      estado.compAtivo = true;
+    } else {
+      wrap.style.opacity = '.4';
+      wrap.style.pointerEvents = 'none';
+      estado.compAtivo = false;
+    }
+  };
+
+  /* === 7) atualizarTudo() REESCRITO COMPLETAMENTE ===
+     Lê o estado dos filtros, chama filtrar/filtrarComp, calcula KPIs
+     e dispara a renderização de todos os componentes da Aba 1. */
+  window.atualizarTudo = function(){
+    estado.unidade = document.getElementById('f-unidade').value;
+    estado.ano = parseInt(document.getElementById('f-ano').value);
+    estado.mesDe = parseInt(document.getElementById('f-mes-de').value) || 0;
+    estado.mesAte = parseInt(document.getElementById('f-mes-ate').value) || 11;
+    estado.anoComp = parseInt(document.getElementById('f-ano-comp').value) || 2025;
+
+    /* Se mês único ativo, força mesDe = mesAte */
+    if (window._mesUnicoAtivo) {
+      var selRef = document.getElementById('f-mes-ref');
+      if (selRef) {
+        var val = parseInt(selRef.value) || estado.mesDe;
+        estado.mesDe = val;
+        estado.mesAte = val;
+        /* Atualiza os selects ocultos para consistência */
+        document.getElementById('f-mes-de').value = val;
+        document.getElementById('f-mes-ate').value = val;
+      }
+    }
+
+    if (estado.mesDe > estado.mesAte) {
+      estado.mesDe = estado.mesAte;
+      document.getElementById('f-mes-de').value = estado.mesAte;
+    }
+
+    var d = filtrar(estado.ano, estado.mesDe, estado.mesAte, estado.unidade);
+    var dc = filtrarComp(estado.anoComp, estado.mesDe, estado.mesAte, estado.unidade);
+    var k = calcKPIs(d), kc = calcKPIs(dc), y = calcYoY(k, kc);
+
+    if (!k) return;
+
+    /* Atualiza período info */
+    var mn = FIN_DATA.meses_ordem.slice(estado.mesDe, estado.mesAte + 1);
+    var elPeriodo = document.getElementById('periodo-info');
+    if (elPeriodo) {
+      elPeriodo.textContent = mn[0] + (mn.length > 1 ? '–' + mn[mn.length - 1] : '') + ' · ' + estado.ano;
+    }
+
+    /* Atualiza badge de benchmark */
+    var bb = document.getElementById('bench-badge');
+    var bt = document.getElementById('bench-text');
+    if (bb && bt) {
+      if (estado.compAtivo) {
+        bb.classList.remove('off');
+        bt.textContent = '📊 ' + estado.anoComp + ' vs ' + estado.ano;
+      } else {
+        bb.classList.add('off');
+        bt.textContent = '📊 ' + estado.ano + ' only';
+      }
+    }
+
+    /* Atualiza KPIs */
+    atualizarKPIs(k, y);
+
+    /* Destrói e recria gráficos */
+    Object.keys(charts).forEach(function(k2){
+      if (charts[k2] && k2.startsWith('fin_')) {
+        charts[k2].destroy();
+        delete charts[k2];
+      }
+    });
+
+    /* Re-renderiza tudo */
+    renderBench(d, dc);
+    renderEvol(d);
+    renderFluxoFin(d);
+    renderRank();
+    renderDonut();
+    renderComp();
+    renderTabela(d, dc);
+  };
+
+  /* === 8) atualizarKPIs() preservado === */
+  window.atualizarKPIs = function(k, y){
+    var set = function(id, v, neg, mom, yoy, sid, sd, cor){
+      var el = document.getElementById('k-' + id);
+      if (!el) return;
+      el.textContent = fmtBRL(v);
+      el.className = 'kpi-value mb-1 ' + (neg ? 'neg' : 'pos');
+      var elMom = document.getElementById('k-' + id + '-mom');
+      if (elMom) elMom.innerHTML = tagH(mom, 'MoM', 'mom');
+      var elYoy = document.getElementById('k-' + id + '-yoy');
+      if (elYoy) elYoy.innerHTML = (estado.compAtivo && yoy !== 0) ? tagH(yoy, 'YoY', 'yoy') : '';
+      spark(sid, sd, cor);
+    };
+
+    set('fat', k.venda, k.venda < 0, k.mV, y.yV, 's-fat', k.sV, '#0EA5E9');
+    set('res', k.res, k.res < 0, k.mR, y.yR, 's-res', k.sR, '#6366F1');
+    set('comp', k.compra, false, k.mC, y.yC, 's-comp', k.sC, '#8B5CF6');
+    set('rec', k.rec, false, k.mRc, y.yRc, 's-rec', k.sRc, '#06B6D4');
+    set('saldo', k.saldo, k.saldo < 0, k.mS, y.yS, 's-saldo', k.sS, k.saldo < 0 ? '#F87171' : '#34D399');
+
+    var em = document.getElementById('k-marg');
+    if (em) {
+      em.textContent = fmtPct(k.margem);
+      em.className = 'kpi-value mb-1 ' + (k.margem < 0 ? 'neg' : 'pos');
+    }
+    var elMargMom = document.getElementById('k-marg-mom');
+    if (elMargMom) elMargMom.innerHTML = tagH(k.mM, 'pp MoM', 'mom');
+    var elMargYoy = document.getElementById('k-marg-yoy');
+    if (elMargYoy) elMargYoy.innerHTML = (estado.compAtivo && y.yM !== 0) ? tagH(y.yM, 'pp YoY', 'yoy') : '';
+    spark('s-marg', k.sM, '#FBBF24');
+  };
+
+  /* === 9) Adiciona botão "Somente este mês" e select de mês único === */
+  function adicionarControlesMesUnico(){
+    var containerFiltros = document.querySelector('#content-fin .glass .grid');
+    if (!containerFiltros) return false;
+
+    /* Não adiciona duas vezes */
+    if (document.getElementById('btn-mes-unico')) return true;
+
+    /* Cria o botão toggle */
+    var wrapBtn = document.createElement('div');
+    wrapBtn.className = 'filter-group';
+    wrapBtn.style.display = 'flex';
+    wrapBtn.style.alignItems = 'flex-end';
+    wrapBtn.innerHTML =
+      '<button id="btn-mes-unico" class="btn-mes-unico" type="button">' +
+      '📅 Somente este mês' +
+      '</button>';
+    containerFiltros.appendChild(wrapBtn);
+
+    /* Cria o select de mês de referência (oculto inicialmente) */
+    var wrapRef = document.createElement('div');
+    wrapRef.className = 'filter-group';
+    wrapRef.id = 'wrap-mes-ref';
+    wrapRef.style.display = 'none';
+    wrapRef.innerHTML =
+      '<label class="filter-label">Mês de Referência</label>' +
+      '<select id="f-mes-ref" class="filter-select w-full"></select>';
+    containerFiltros.appendChild(wrapRef);
+
+    /* Event listeners */
+    var btn = document.getElementById('btn-mes-unico');
+    btn.addEventListener('click', toggleMesUnico);
+
+    var selRef = document.getElementById('f-mes-ref');
+    selRef.addEventListener('change', function(){
+      if (window._mesUnicoAtivo) {
+        atualizarTudo();
+      }
+    });
+
+    return true;
+  }
+
+  /* === 10) toggleMesUnico: alterna entre modo intervalo e mês isolado === */
+  window._mesUnicoAtivo = false;
+  function toggleMesUnico(){
+    window._mesUnicoAtivo = !window._mesUnicoAtivo;
+    var btn = document.getElementById('btn-mes-unico');
+    var wrapDe = document.getElementById('f-mes-de').closest('.filter-group');
+    var wrapAte = document.getElementById('f-mes-ate').closest('.filter-group');
+    var wrapRef = document.getElementById('wrap-mes-ref');
+
+    if (window._mesUnicoAtivo) {
+      /* Modo mês único: esconde De/Até, mostra Referência */
+      btn.classList.add('active');
+      btn.textContent = '📅 Mês isolado: ON';
+      if (wrapDe) wrapDe.style.display = 'none';
+      if (wrapAte) wrapAte.style.display = 'none';
+      if (wrapRef) wrapRef.style.display = '';
+
+      /* Sincroniza o mês de referência com o mês De atual */
+      var selDe = document.getElementById('f-mes-de');
+      var selRef = document.getElementById('f-mes-ref');
+      if (selDe && selRef) {
+        selRef.innerHTML = selDe.innerHTML;
+        selRef.value = selDe.value;
+      }
+    } else {
+      /* Modo intervalo: mostra De/Até, esconde Referência */
+      btn.classList.remove('active');
+      btn.textContent = '📅 Somente este mês';
+      if (wrapDe) wrapDe.style.display = '';
+      if (wrapAte) wrapAte.style.display = '';
+      if (wrapRef) wrapRef.style.display = 'none';
+
+      /* Sincroniza: De = Até = Referência (para não pular) */
+      var selRef2 = document.getElementById('f-mes-ref');
+      var selDe2 = document.getElementById('f-mes-de');
+      var selAte2 = document.getElementById('f-mes-ate');
+      if (selRef2 && selDe2) selDe2.value = selRef2.value;
+      if (selRef2 && selAte2) selAte2.value = selRef2.value;
+    }
+    atualizarTudo();
+  }
+  window.toggleMesUnico = toggleMesUnico;
+
+  /* === 11) init() reescrito com retry robusto === */
+  function initCustom(){
+    /* Tenta adicionar os controles, com retry se o DOM não está pronto */
+    var tentativas = 0;
+    function tentar(){
+      if (adicionarControlesMesUnico()) {
+        /* Sucesso: popula o mês de referência e renderiza */
+        window.atualizarMeses();
+        var selDe = document.getElementById('f-mes-de');
+        var selRef = document.getElementById('f-mes-ref');
+        if (selDe && selRef && !selRef.innerHTML) {
+          selRef.innerHTML = selDe.innerHTML;
+          selRef.value = selDe.value;
+        }
+        atualizarTudo();
+      } else if (tentativas < 10) {
+        tentativas++;
+        setTimeout(tentar, 100);
+      }
+    }
+    tentar();
+  }
+
+  /* === 12) Executa quando o DOM estiver pronto === */
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initCustom);
+  } else {
+    /* DOM já carregou — executa imediatamente */
+    initCustom();
+  }
+})();
+"""
+
+def aplicar_css_responsivo(html):
+    """Insere viewport + CSS responsivo não-invasivo no HTML."""
+    if 'viewport' not in html.lower():
+        viewport = ('<meta name="viewport" content="width=device-width, '
+                    'initial-scale=1.0, viewport-fit=cover">')
+        match = re.search(r'<head[^>]*>', html, re.IGNORECASE)
+        if match:
+            html = html[:match.end()] + '\n  ' + viewport + html[match.end():]
+        else:
+            html = viewport + '\n' + html
+
+    estilo = '<style>\n' + CSS_RESPONSIVO + '\n</style>'
+    if re.search(r'</head>', html, re.IGNORECASE):
+        html = re.sub(r'</head>', estilo + '\n</head>', html, count=1, flags=re.IGNORECASE)
+    else:
+        html = html + '\n' + estilo
+
+    return html
+
+def injetar_js_filtros(html):
+    """Injeta o JS de correção antes de </body> (depois do script original)."""
+    script = '<script>\n' + JS_CORRECAO_FILTROS + '\n</script>'
+    if re.search(r'</body>', html, re.IGNORECASE):
+        html = re.sub(r'</body>', script + '\n</body>', html, count=1, flags=re.IGNORECASE)
+    else:
+        html = html + '\n' + script
+    return html
+
+def executar_extensao():
+    print("=" * 60)
+    print("ENGIPEC — EXTENSÃO DE INTELIGÊNCIA CORPORATIVA v1.8")
+    print("=" * 60)
+
+    # 1. Coleta os dados do motor original
+    print("\n[1/3] Puxando dados consolidados do motor original...")
+    data_fin = motor_original.processar_financeiro()
+    data_teto = motor_original.processar_teto(data_fin)
+    data_fluxo = motor_original.processar_fluxo()
+    logo_src = motor_original.carregar_logo_base64()
+    print("  ✓ Integração de dados concluída com sucesso!")
+
+    # 2. Espaço para novas lógicas
+    print("\n[2/3] Processando novos indicadores e inteligência de negócios...")
+    faturamento_total = sum(r['venda'] for r in data_fin['registros'] if r['ano'] == 2026)
+    print(f"  ✓ Faturamento Geral Detectado (2026): R$ {faturamento_total:,.2f}")
+
+    # 3. Renderiza o HTML e aplica responsividade + correção de filtros
+    print("\n[3/3] Renderizando interface corporativa unificada...")
+    html_final = motor_original.gerar_html(data_fin, data_teto, data_fluxo, logo_src)
+    html_final = aplicar_css_responsivo(html_final)
+    html_final = injetar_js_filtros(html_final)
+
+    nome_saida_html = "DASHBOARD_ENGIPEC_EXPANDIDO.html"
+    Path(nome_saida_html).write_text(html_final, encoding='utf-8')
+    print(f"  ✓ Painel gerado com sucesso: {nome_saida_html}")
+
+    webbrowser.open(Path(nome_saida_html).resolve().as_uri())
+    print("  ✓ Navegador aberto.")
+
+    print("=" * 60)
+
+if __name__ == '__main__':
+    executar_extensao()
